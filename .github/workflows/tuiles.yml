@@ -1,0 +1,344 @@
+# Chasse : tuiles topographiques LiDAR du Québec (fichier unique, installable depuis un téléphone)
+# Données : MRNF Québec, produits dérivés du LiDAR (Données Québec, CC-BY 4.0)
+name: Tuiles topo LiDAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocs:
+        description: "Blocs 1:250 000 séparés par des virgules (Gaspésie : 22A,22B,22C)"
+        required: true
+        default: "22A,22B,22C"
+      nettoyer:
+        description: "Effacer les fichiers intermédiaires après l'assemblage"
+        type: boolean
+        default: true
+
+env:
+  STORAGE: r2
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+      blocs: ${{ steps.p.outputs.blocs }}
+    steps:
+      - name: Vérifier les secrets
+        run: |
+          for v in R2_ACCOUNT_ID R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!v}" ] || { echo "Secret manquant : $v"; exit 1; }
+          done
+      - name: Écrire les scripts
+        run: |
+          mkdir -p scripts
+          cat > scripts/common.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # Fonctions partagées : stockage (Cloudflare R2, ou dossier local pour les tests)
+          set -euo pipefail
+          STORAGE="${STORAGE:-r2}"            # r2 | local
+          LOCAL_STORE="${LOCAL_STORE:-$PWD/store}"
+          LIDAR_BASE="https://diffusion.mffp.gouv.qc.ca/Diffusion/DonneeGratuite/Foret/IMAGERIE/Produits_derives_LiDAR"
+
+          r2() { aws s3 --only-show-errors --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" "$@"; }
+
+          put() {  # put <fichier> <clé>
+            if [ "$STORAGE" = local ]; then mkdir -p "$LOCAL_STORE/$(dirname "$2")"; cp "$1" "$LOCAL_STORE/$2"
+            else r2 cp "$1" "s3://${R2_BUCKET}/$2"; fi
+          }
+          get() {  # get <clé> <fichier>
+            if [ "$STORAGE" = local ]; then cp "$LOCAL_STORE/$1" "$2"
+            else r2 cp "s3://${R2_BUCKET}/$1" "$2"; fi
+          }
+          exists() {  # exists <clé>
+            if [ "$STORAGE" = local ]; then [ -f "$LOCAL_STORE/$1" ]
+            else r2 ls "s3://${R2_BUCKET}/$1" >/dev/null 2>&1; fi
+          }
+          list_dirs() {  # list_dirs <préfixe/>  -> noms des sous-dossiers
+            if [ "$STORAGE" = local ]; then ls -1 "$LOCAL_STORE/$1" 2>/dev/null || true
+            else r2 ls "s3://${R2_BUCKET}/$1" | awk '/PRE/{sub("/","",$2); print $2}'; fi
+          }
+          fetch() {  # fetch <url> <fichier> : téléchargement robuste
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$2" "$1"
+          }
+          log() { echo "[$(date +%H:%M:%S)] $*"; }
+          FIN_DU_FICHIER
+          cat > scripts/setup.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # Installe les outils sur la machine GitHub (Ubuntu 24.04)
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdal-bin python3-gdal python3-numpy python3-pil tippecanoe >/dev/null
+          python3 -m pip install -q --user --break-system-packages pmtiles
+          echo "$HOME/.local/bin" >> "${GITHUB_PATH:-/dev/null}"
+          gdalinfo --version; tippecanoe --version 2>&1 | head -1
+          FIN_DU_FICHIER
+          cat > scripts/plan.py <<'FIN_DU_FICHIER'
+          #!/usr/bin/env python3
+          """Liste les feuillets LiDAR 1:20 000 des blocs demandés et les regroupe en lots
+          pour la matrice GitHub Actions (max 256 tâches par exécution)."""
+          import argparse, json, urllib.request
+          INDEX = ("https://diffusion.mffp.gouv.qc.ca/Diffusion/DonneeGratuite/Foret/IMAGERIE/"
+                   "Produits_derives_LiDAR/Produit_derive_lidar/03-Telechargement/URL_Lidar.geojson")
+          p = argparse.ArgumentParser()
+          p.add_argument("--blocs", required=True, help="ex: 22A,22B,22C")
+          p.add_argument("--batch", type=int, default=4)
+          a = p.parse_args()
+          blocs = [b.strip().upper() for b in a.blocs.split(",") if b.strip()]
+          data = json.load(urllib.request.urlopen(INDEX, timeout=120))
+          sheets = sorted({f["properties"]["Feuillet20K"] for f in data["features"]
+                           if f["properties"]["Feuillet250K"] in blocs})
+          if not sheets:
+              raise SystemExit(f"Aucun feuillet trouvé pour {blocs}")
+          n = max(a.batch, -(-len(sheets) // 256))  # garantit <= 256 tâches
+          batches = [" ".join(sheets[i:i + n]) for i in range(0, len(sheets), n)]
+          print("matrix=" + json.dumps({"include": [{"batch": b} for b in batches]}))
+          print("blocs=" + json.dumps(sorted({s[:3] for s in sheets})))
+          print("count=" + str(len(sheets)))
+          FIN_DU_FICHIER
+          cat > scripts/dem_to_i16.py <<'FIN_DU_FICHIER'
+          #!/usr/bin/env python3
+          """Convertit un MNT flottant (m) en Int16 décimètres compressé : ~20x plus léger.
+          Plage utile : -3276 m à +3276 m, précision 10 cm. NoData = -32768."""
+          import sys, numpy as np
+          from osgeo import gdal
+          src, dst = sys.argv[1], sys.argv[2]
+          ds = gdal.Open(src); b = ds.GetRasterBand(1); nd = b.GetNoDataValue()
+          W, H = ds.RasterXSize, ds.RasterYSize
+          out = gdal.GetDriverByName("GTiff").Create(dst, W, H, 1, gdal.GDT_Int16,
+                ["COMPRESS=DEFLATE", "PREDICTOR=2", "ZLEVEL=9", "TILED=YES"])
+          out.SetGeoTransform(ds.GetGeoTransform()); out.SetProjection(ds.GetProjection())
+          ob = out.GetRasterBand(1); ob.SetNoDataValue(-32768)
+          step = 1024
+          for y in range(0, H, step):
+              h = min(step, H - y)
+              a = np.frombuffer(b.ReadRaster(0, y, W, h, buf_type=gdal.GDT_Float32), np.float32).reshape(h, W)
+              m = ~np.isfinite(a) | (a == nd if nd is not None else False) | (a < -3000)
+              v = np.where(m, -32768, np.clip(np.round(a * 10), -32767, 32767)).astype(np.int16)
+              ob.WriteRaster(0, y, W, h, v.tobytes(), buf_type=gdal.GDT_Int16)
+          out.FlushCache(); out = None
+          print("ok", dst)
+          FIN_DU_FICHIER
+          cat > scripts/terrain.py <<'FIN_DU_FICHIER'
+          #!/usr/bin/env python3
+          """Génère des tuiles d'élévation « terrain-RGB » (encodage Mapbox, base -10000 m,
+          pas de 0,1 m) en WebP sans perte, 512 px, à partir d'un MNT Int16 en décimètres
+          (EPSG:3857). Le téléphone calcule lui-même l'ombrage et la 3D avec ces tuiles.
+          Usage : terrain.py <dem.vrt> <sortie.mbtiles> <zmin> <zmax>"""
+          import io, sqlite3, sys, numpy as np
+          from osgeo import gdal
+          from PIL import Image
+          src, out, zmin, zmax = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+          T, R = 512, 20037508.342789244
+          ds = gdal.Open(src)
+          gt = ds.GetGeoTransform(); W, H = ds.RasterXSize, ds.RasterYSize
+          minx, maxy = gt[0], gt[3]; maxx = minx + W * gt[1]; miny = maxy + H * gt[5]
+          db = sqlite3.connect(out)
+          db.execute("create table if not exists tiles(zoom_level int, tile_column int, tile_row int, tile_data blob, primary key(zoom_level, tile_column, tile_row))")
+          db.execute("create table if not exists metadata(name text, value text)")
+          n = tot = 0; emin, emax = 1e9, -1e9
+          for z in range(zmin, zmax + 1):
+              size = 2 * R / (1 << z)
+              x0, x1 = int((minx + R) // size), int((maxx + R) // size)
+              y0, y1 = int((R - maxy) // size), int((R - miny) // size)
+              for x in range(x0, x1 + 1):
+                  for y in range(y0, y1 + 1):
+                      bx, by = -R + x * size, R - (y + 1) * size
+                      t = gdal.Warp("", ds, format="MEM", outputBounds=(bx, by, bx + size, by + size),
+                                    width=T, height=T, resampleAlg="average",
+                                    srcNodata=-32768, dstNodata=-32768, outputType=gdal.GDT_Int16)
+                      a = np.frombuffer(t.GetRasterBand(1).ReadRaster(buf_type=gdal.GDT_Int16), np.int16).reshape(T, T)
+                      mask = a == -32768
+                      if mask.all():
+                          continue
+                      m = a.astype(np.float64) / 10.0
+                      emin, emax = min(emin, m[~mask].min()), max(emax, m[~mask].max())
+                      m[mask] = 0
+                      v = np.clip(np.round((m + 10000) * 10), 0, 2**24 - 1).astype(np.uint32)
+                      rgba = np.dstack([(v >> 16) & 255, (v >> 8) & 255, v & 255,
+                                        np.where(mask, 0, 255)]).astype(np.uint8)
+                      buf = io.BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, "WEBP", lossless=True, method=4)
+                      d = buf.getvalue()
+                      db.execute("insert or replace into tiles values(?,?,?,?)", (z, x, (1 << z) - 1 - y, d))
+                      n += 1; tot += len(d)
+          import math
+          def ll(x, y): return x / R * 180, math.degrees(2 * math.atan(math.exp(y / R * math.pi)) - math.pi / 2)
+          lo0, la0 = ll(minx, miny); lo1, la1 = ll(maxx, maxy)
+          db.execute("delete from metadata")
+          db.executemany("insert into metadata values(?,?)", [("name", "terrain"), ("format", "webp"),
+              ("type", "baselayer"), ("minzoom", str(zmin)), ("maxzoom", str(zmax)), ("encoding", "mapbox"),
+              ("bounds", f"{lo0:.6f},{la0:.6f},{lo1:.6f},{la1:.6f}"),
+              ("center", f"{(lo0+lo1)/2:.6f},{(la0+la1)/2:.6f},{zmin + 4}")])
+          db.commit()
+          if n == 0:
+              raise SystemExit("ERREUR : aucune tuile de terrain produite")
+          if emin < -100 or emax > 2000:
+              raise SystemExit(f"ERREUR : élévations suspectes {emin:.1f} à {emax:.1f} m")
+          print(f"terrain OK : {n} tuiles, {tot // 1024} Ko, élévation {emin:.1f} à {emax:.1f} m")
+          FIN_DU_FICHIER
+          cat > scripts/process_sheet.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # PHASE A : un feuillet LiDAR 1:20 000 -> fichiers intermédiaires légers sur R2.
+          #   - courbes de niveau réparties par intervalle (50, 10, 5, 1 m) en GeoJSON compressé
+          #   - MNT réduit à 3 m en EPSG:3857, Int16 décimètres (~10 Mo au lieu de 469 Mo)
+          # Idempotent : un feuillet déjà traité est sauté (relance sans risque).
+          source "$(dirname "$0")/common.sh"
+          SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+          S="$1"; B="${S:0:3}"; KEY="intermediaire/$S"
+          if exists "$KEY/ok.json"; then log "$S déjà traité, on saute"; exit 0; fi
+          W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT; cd "$W"
+
+          log "$S : téléchargement"
+          fetch "$LIDAR_BASE/$B/$S/Courbes_$S.gpkg.zip" c.zip
+          fetch "$LIDAR_BASE/$B/$S/MNT_$S.tif" mnt.tif
+          unzip -q -o c.zip
+          G="$(ls *.gpkg | head -1)"; L="$(ogrinfo -q "$G" | awk -F'[: ]+' '/Line String/{print $2; exit}')"
+          [ -n "$L" ] || { echo "ERREUR : couche de courbes introuvable dans $G"; exit 1; }
+
+          log "$S : courbes de niveau"
+          declare -A N
+          for spec in "50:0" "10:50" "5:10" "1:5"; do
+            m="${spec%%:*}"; ex="${spec##*:}"
+            cond="ELEVATION % $m = 0"; [ "$ex" != 0 ] && cond="$cond AND ELEVATION % $ex <> 0"
+            ogr2ogr -f GeoJSONSeq -t_srs EPSG:4326 -lco RS=NO -lco COORDINATE_PRECISION=6 "c$m.geojsons" "$G" \
+              -dialect SQLite -sql "SELECT geom, ELEVATION AS e FROM \"$L\" WHERE $cond"
+            N[$m]="$(wc -l < "c$m.geojsons")"
+            gzip -9 "c$m.geojsons"
+          done
+          TOTAL="$(ogrinfo -q -ro "$G" -sql "SELECT COUNT(*) AS n FROM \"$L\"" | awk -F'= ' '/n \(/{print $2}')"
+          SUM=$(( N[50] + N[10] + N[5] + N[1] ))
+          [ "$SUM" = "$TOTAL" ] || { echo "ERREUR : $SUM courbes réparties sur $TOTAL dans la source"; exit 1; }
+
+          log "$S : modèle de terrain"
+          gdalwarp -q -t_srs EPSG:3857 -tr 3 3 -tap -r average -srcnodata -9999 -dstnodata -9999 \
+            -wm 1024 -co TILED=YES mnt.tif m3857.tif
+          python3 "$SCRIPTS/dem_to_i16.py" m3857.tif dem.tif
+
+          for m in 50 10 5 1; do put "c$m.geojsons.gz" "$KEY/c$m.geojsons.gz"; done
+          put dem.tif "$KEY/dem.tif"
+          printf '{"feuillet":"%s","courbes":{"50":%s,"10":%s,"5":%s,"1":%s},"total":%s}\n' \
+            "$S" "${N[50]}" "${N[10]}" "${N[5]}" "${N[1]}" "$TOTAL" > ok.json
+          put ok.json "$KEY/ok.json"   # écrit en DERNIER : sa présence = feuillet complet
+          log "$S : terminé ($TOTAL courbes)"
+          FIN_DU_FICHIER
+          cat > scripts/build_block.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # PHASE B : assemble tous les feuillets d'un bloc 1:250 000 (ex. 22A) en 2 fichiers
+          # PMTiles prêts pour l'app, avec vérifications automatiques :
+          #   tuiles/<BLOC>/courbes.pmtiles  (vecteurs : c50 dès z11, c10 z13, c5 z14, c1 z15)
+          #   tuiles/<BLOC>/terrain.pmtiles  (élévation terrain-RGB 512 px, z8 à z14 ≈ 3 m)
+          source "$(dirname "$0")/common.sh"
+          SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+          BLOC="$1"
+          W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT; cd "$W"
+          mkdir -p in
+
+          log "$BLOC : récupération des feuillets traités"
+          SHEETS=$(list_dirs "intermediaire/" | grep "^$BLOC" || true)
+          [ -n "$SHEETS" ] || { echo "ERREUR : aucun feuillet traité pour $BLOC"; exit 1; }
+          declare -A EXP=([50]=0 [10]=0 [5]=0 [1]=0)
+          NS=0
+          for S in $SHEETS; do
+            exists "intermediaire/$S/ok.json" || { echo "ERREUR : feuillet $S incomplet"; exit 1; }
+            get "intermediaire/$S/ok.json" "in/$S.json"
+            for m in 50 10 5 1; do
+              get "intermediaire/$S/c$m.geojsons.gz" "in/$S.c$m.geojsons.gz"
+              EXP[$m]=$(( EXP[$m] + $(python3 -c "import json;print(json.load(open('in/$S.json'))['courbes']['$m'])") ))
+            done
+            get "intermediaire/$S/dem.tif" "in/$S.dem.tif"
+            NS=$((NS+1))
+          done
+          log "$BLOC : $NS feuillets"
+
+          log "$BLOC : tuiles de courbes"
+          for spec in "50:11" "10:13" "5:14" "1:15"; do
+            m="${spec%%:*}"; z="${spec##*:}"
+            zcat in/*.c$m.geojsons.gz | tippecanoe -q -o "c$m.mbtiles" -Z"$z" -z15 --force \
+              --no-feature-limit --no-tile-size-limit -l "c$m" -t "$W"
+            GOT=$(ogrinfo -ro -al -so -oo ZOOM_LEVEL=15 "c$m.mbtiles" | awk -F': ' '/Feature Count/{print $2}')
+            # Chaque courbe coupée aux bords des tuiles compte plusieurs fois : GOT doit être >= attendu.
+            [ "${GOT:-0}" -ge "${EXP[$m]}" ] || { echo "ERREUR c$m : $GOT entités dans les tuiles pour ${EXP[$m]} courbes source"; exit 1; }
+            log "  c$m : ${EXP[$m]} courbes -> $GOT entités à z15 OK"
+          done
+          tile-join -q -f -o courbes.pmtiles -n "courbes-$BLOC" c50.mbtiles c10.mbtiles c5.mbtiles c1.mbtiles
+          IN_BYTES=$(cat in/*.geojsons.gz | wc -c); OUT_BYTES=$(stat -c %s courbes.pmtiles)
+          # Garde-fou : si l'outil jette des courbes en silence, le fichier devient anormalement petit.
+          [ $(( OUT_BYTES * 100 / IN_BYTES )) -ge 10 ] || { echo "ERREUR : courbes.pmtiles suspect ($OUT_BYTES o pour $IN_BYTES o en entrée)"; exit 1; }
+
+          log "$BLOC : tuiles de terrain"
+          gdalbuildvrt -q dem.vrt in/*.dem.tif
+          python3 "$SCRIPTS/terrain.py" dem.vrt terrain.mbtiles 8 14
+          pmtiles-convert terrain.mbtiles terrain.pmtiles >/dev/null 2>&1
+
+          put courbes.pmtiles "tuiles/$BLOC/courbes.pmtiles"
+          put terrain.pmtiles "tuiles/$BLOC/terrain.pmtiles"
+          printf '{"bloc":"%s","feuillets":%s,"courbes_mo":%s,"terrain_mo":%s,"date":"%s"}\n' "$BLOC" "$NS" \
+            "$(( $(stat -c %s courbes.pmtiles) / 1048576 ))" "$(( $(stat -c %s terrain.pmtiles) / 1048576 ))" \
+            "$(date -u +%FT%TZ)" > manifeste.json
+          put manifeste.json "tuiles/$BLOC/manifeste.json"
+          cat manifeste.json
+
+          # Les fichiers intermédiaires ne servent plus : on libère l'espace R2 (10 Go gratuits).
+          if [ "${NETTOYER:-1}" = 1 ]; then
+            log "$BLOC : nettoyage des fichiers intermédiaires"
+            for S in $SHEETS; do
+              if [ "$STORAGE" = local ]; then rm -rf "$LOCAL_STORE/intermediaire/$S"
+              else r2 rm --recursive "s3://${R2_BUCKET}/intermediaire/$S/"; fi
+            done
+          fi
+          FIN_DU_FICHIER
+          chmod +x scripts/*
+          ls -la scripts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scripts
+          path: scripts/
+          retention-days: 3
+      - id: p
+        name: Lister les feuillets
+        run: python3 scripts/plan.py --blocs "${{ inputs.blocs }}" --batch 4 | tee -a "$GITHUB_OUTPUT"
+
+  feuillets:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: scripts
+      - run: bash scripts/setup.sh
+      - name: Traiter les feuillets
+        run: for s in ${{ matrix.batch }}; do bash scripts/process_sheet.sh "$s"; done
+
+  blocs:
+    needs: [plan, feuillets]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        bloc: ${{ fromJson(needs.plan.outputs.blocs) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scripts
+          path: scripts
+      - run: bash scripts/setup.sh
+      - name: Libérer de l'espace disque
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - name: Assembler le bloc
+        env:
+          NETTOYER: ${{ inputs.nettoyer && '1' || '0' }}
+        run: bash scripts/build_block.sh "${{ matrix.bloc }}"
