@@ -1,4 +1,4 @@
-# Chasse : tuiles topographiques LiDAR du Québec (fichier unique, installable depuis un téléphone)
+# Chasse : tuiles topographiques LiDAR du Québec (version 2, fichier unique)
 # Données : MRNF Québec, produits dérivés du LiDAR (Données Québec, CC-BY 4.0)
 name: Tuiles topo LiDAR
 
@@ -34,7 +34,7 @@ jobs:
       - name: Vérifier les secrets
         run: |
           for v in R2_ACCOUNT_ID R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            [ -n "${!v}" ] || { echo "Secret manquant : $v"; exit 1; }
+            [ -n "${!v}" ] || { echo "::error title=Secret manquant::$v"; exit 1; }
           done
       - name: Écrire les scripts
         run: |
@@ -42,7 +42,14 @@ jobs:
           cat > scripts/common.sh <<'FIN_DU_FICHIER'
           #!/usr/bin/env bash
           # Fonctions partagées : stockage (Cloudflare R2, ou dossier local pour les tests)
-          set -euo pipefail
+          set -Eeuo pipefail
+          # Toute commande qui échoue affiche une annotation visible sur la page du traitement.
+          trap 'rc=$?; echo "::error title=Échec ${S:-${BLOC:-}}::ligne $LINENO de $(basename "$0") : $BASH_COMMAND (code $rc)"' ERR
+          fail() {  # fail <message> : arrêt avec message clair (annotation + résumé)
+            echo "::error title=Erreur::$*"
+            [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "### ❌ $*" >> "$GITHUB_STEP_SUMMARY"
+            trap - ERR; exit 1
+          }
           STORAGE="${STORAGE:-r2}"            # r2 | local
           LOCAL_STORE="${LOCAL_STORE:-$PWD/store}"
           LIDAR_BASE="https://diffusion.mffp.gouv.qc.ca/Diffusion/DonneeGratuite/Foret/IMAGERIE/Produits_derives_LiDAR"
@@ -57,9 +64,13 @@ jobs:
             if [ "$STORAGE" = local ]; then cp "$LOCAL_STORE/$1" "$2"
             else r2 cp "s3://${R2_BUCKET}/$1" "$2"; fi
           }
-          exists() {  # exists <clé>
-            if [ "$STORAGE" = local ]; then [ -f "$LOCAL_STORE/$1" ]
-            else r2 ls "s3://${R2_BUCKET}/$1" >/dev/null 2>&1; fi
+          exists() {  # exists <clé> : 0 = existe, 1 = absent, arrêt si R2 refuse l'accès
+            if [ "$STORAGE" = local ]; then [ -f "$LOCAL_STORE/$1" ]; return; fi
+            local out
+            if out=$(aws s3api head-object --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+                     --bucket "$R2_BUCKET" --key "$1" 2>&1); then return 0; fi
+            if grep -qE "Not Found|404|NoSuchKey" <<<"$out"; then return 1; fi
+            fail "R2 inaccessible : $(echo "$out" | tail -1)"
           }
           list_dirs() {  # list_dirs <préfixe/>  -> noms des sous-dossiers
             if [ "$STORAGE" = local ]; then ls -1 "$LOCAL_STORE/$1" 2>/dev/null || true
@@ -72,13 +83,39 @@ jobs:
           FIN_DU_FICHIER
           cat > scripts/setup.sh <<'FIN_DU_FICHIER'
           #!/usr/bin/env bash
-          # Installe les outils sur la machine GitHub (Ubuntu 24.04)
+          # Installe les outils sur la machine GitHub (Ubuntu 24.04), puis vérifie qu'ils répondent.
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gdal-bin python3-gdal python3-numpy python3-pil tippecanoe >/dev/null
-          python3 -m pip install -q --user --break-system-packages pmtiles
+          sudo apt-get install -y -qq gdal-bin python3-gdal python3-numpy python3-pil python3-pip tippecanoe unzip >/dev/null
+          /usr/bin/python3 -m pip install -q --user --break-system-packages pmtiles
           echo "$HOME/.local/bin" >> "${GITHUB_PATH:-/dev/null}"
-          gdalinfo --version; tippecanoe --version 2>&1 | head -1
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "python3 dans le PATH : $(command -v python3) ; système : /usr/bin/python3"
+          /usr/bin/python3 -c "from osgeo import gdal; import numpy; from PIL import Image; print('GDAL', gdal.__version__, 'numpy', numpy.__version__)"
+          gdalinfo --version; ogr2ogr --version; tippecanoe --version 2>&1 | head -1
+          command -v tile-join pmtiles-convert unzip >/dev/null
+          aws --version
+          echo "Outils OK"
+          FIN_DU_FICHIER
+          cat > scripts/test_r2.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # Test de connexion R2 : écrit, relit et efface un petit fichier. Arrêt immédiat si échec.
+          source "$(dirname "$0")/common.sh"
+          echo "test $(date -u +%FT%TZ)" > /tmp/r2test.txt
+          out=$(r2 cp /tmp/r2test.txt "s3://${R2_BUCKET}/_test/connexion.txt" 2>&1) || \
+            fail "Écriture R2 refusée. Vérifie R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (même jeton, Object Read & Write sur ${R2_BUCKET}). Détail : $(echo "$out" | tail -1)"
+          exists "_test/connexion.txt" || fail "Fichier test introuvable après écriture dans R2"
+          r2 rm "s3://${R2_BUCKET}/_test/connexion.txt" >/dev/null 2>&1 || true
+          echo "Connexion R2 OK (bucket ${R2_BUCKET})"
+          FIN_DU_FICHIER
+          cat > scripts/test_serveur.sh <<'FIN_DU_FICHIER'
+          #!/usr/bin/env bash
+          # Vérifie que la machine GitHub peut télécharger depuis le serveur du gouvernement du Québec.
+          source "$(dirname "$0")/common.sh"
+          U="$LIDAR_BASE/Produit_derive_lidar/03-Telechargement/URL_Lidar.geojson"
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$U" || echo "000")
+          [ "$code" = 200 ] || fail "Le serveur LiDAR du Québec ne répond pas aux machines GitHub (code HTTP $code)."
+          echo "Serveur LiDAR OK (HTTP $code)"
           FIN_DU_FICHIER
           cat > scripts/plan.py <<'FIN_DU_FICHIER'
           #!/usr/bin/env python3
@@ -196,8 +233,20 @@ jobs:
           W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT; cd "$W"
 
           log "$S : téléchargement"
-          fetch "$LIDAR_BASE/$B/$S/Courbes_$S.gpkg.zip" c.zip
-          fetch "$LIDAR_BASE/$B/$S/MNT_$S.tif" mnt.tif
+          # Adresses exactes lues dans l'index officiel (plus fiable que de les deviner)
+          IDX=/tmp/index_lidar.geojson
+          [ -s "$IDX" ] || fetch "$LIDAR_BASE/Produit_derive_lidar/03-Telechargement/URL_Lidar.geojson" "$IDX"
+          read -r U_C U_M < <(/usr/bin/python3 - "$IDX" "$S" <<'PY'
+          import json, sys
+          for f in json.load(open(sys.argv[1]))["features"]:
+              p = f["properties"]
+              if p["Feuillet20K"] == sys.argv[2]:
+                  print(p["Courbes_GPKG"], p["MNT"]); break
+          PY
+          )
+          [ -n "${U_C:-}" ] && [ -n "${U_M:-}" ] || fail "Feuillet $S absent de l'index officiel"
+          fetch "$U_C" c.zip
+          fetch "$U_M" mnt.tif
           unzip -q -o c.zip
           G="$(ls *.gpkg | head -1)"; L="$(ogrinfo -q "$G" | awk -F'[: ]+' '/Line String/{print $2; exit}')"
           [ -n "$L" ] || { echo "ERREUR : couche de courbes introuvable dans $G"; exit 1; }
@@ -219,7 +268,7 @@ jobs:
           log "$S : modèle de terrain"
           gdalwarp -q -t_srs EPSG:3857 -tr 3 3 -tap -r average -srcnodata -9999 -dstnodata -9999 \
             -wm 1024 -co TILED=YES mnt.tif m3857.tif
-          python3 "$SCRIPTS/dem_to_i16.py" m3857.tif dem.tif
+          /usr/bin/python3 "$SCRIPTS/dem_to_i16.py" m3857.tif dem.tif
 
           for m in 50 10 5 1; do put "c$m.geojsons.gz" "$KEY/c$m.geojsons.gz"; done
           put dem.tif "$KEY/dem.tif"
@@ -250,7 +299,7 @@ jobs:
             get "intermediaire/$S/ok.json" "in/$S.json"
             for m in 50 10 5 1; do
               get "intermediaire/$S/c$m.geojsons.gz" "in/$S.c$m.geojsons.gz"
-              EXP[$m]=$(( EXP[$m] + $(python3 -c "import json;print(json.load(open('in/$S.json'))['courbes']['$m'])") ))
+              EXP[$m]=$(( EXP[$m] + $(/usr/bin/python3 -c "import json;print(json.load(open('in/$S.json'))['courbes']['$m'])") ))
             done
             get "intermediaire/$S/dem.tif" "in/$S.dem.tif"
             NS=$((NS+1))
@@ -274,7 +323,7 @@ jobs:
 
           log "$BLOC : tuiles de terrain"
           gdalbuildvrt -q dem.vrt in/*.dem.tif
-          python3 "$SCRIPTS/terrain.py" dem.vrt terrain.mbtiles 8 14
+          /usr/bin/python3 "$SCRIPTS/terrain.py" dem.vrt terrain.mbtiles 8 14
           pmtiles-convert terrain.mbtiles terrain.pmtiles >/dev/null 2>&1
 
           put courbes.pmtiles "tuiles/$BLOC/courbes.pmtiles"
@@ -295,15 +344,18 @@ jobs:
           fi
           FIN_DU_FICHIER
           chmod +x scripts/*
-          ls -la scripts
       - uses: actions/upload-artifact@v4
         with:
           name: scripts
           path: scripts/
           retention-days: 3
+      - name: Tester la connexion R2
+        run: bash scripts/test_r2.sh
+      - name: Tester le serveur LiDAR du Québec
+        run: bash scripts/test_serveur.sh
       - id: p
         name: Lister les feuillets
-        run: python3 scripts/plan.py --blocs "${{ inputs.blocs }}" --batch 4 | tee -a "$GITHUB_OUTPUT"
+        run: /usr/bin/python3 scripts/plan.py --blocs "${{ inputs.blocs }}" --batch 4 | tee -a "$GITHUB_OUTPUT"
 
   feuillets:
     needs: plan
