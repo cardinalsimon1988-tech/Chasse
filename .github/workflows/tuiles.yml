@@ -1,4 +1,4 @@
-# Chasse : tuiles topographiques LiDAR du Québec (version 2, fichier unique)
+# Chasse : tuiles topographiques LiDAR du Québec (version 3, fichier unique)
 # Données : MRNF Québec, produits dérivés du LiDAR (Données Québec, CC-BY 4.0)
 name: Tuiles topo LiDAR
 
@@ -99,14 +99,30 @@ jobs:
           FIN_DU_FICHIER
           cat > scripts/test_r2.sh <<'FIN_DU_FICHIER'
           #!/usr/bin/env bash
-          # Test de connexion R2 : écrit, relit et efface un petit fichier. Arrêt immédiat si échec.
+          # Test de connexion R2 : vérifie le format des 4 secrets (sans les révéler),
+          # puis écrit, relit et efface un petit fichier. Arrêt immédiat si échec.
           source "$(dirname "$0")/common.sh"
+          bad=0
+          chk() {  # chk <nom> <valeur> <regex> <attendu>
+            local n="$1" v="$2" re="$3" att="$4" note=""
+            [[ "$v" =~ [[:space:]] ]] && note=" CONTIENT UN ESPACE OU UN SAUT DE LIGNE."
+            [[ "$v" =~ [A-Z] ]] && note="$note Contient des MAJUSCULES."
+            if [[ "$v" =~ $re ]]; then echo "OK   $n : ${#v} caractères, format correct"
+            else echo "::error title=$n mal formé::$n contient ${#v} caractères, attendu : $att.$note"; bad=1; fi
+          }
+          chk R2_ACCOUNT_ID        "$R2_ACCOUNT_ID"         '^[0-9a-f]{32}$' "32 caractères (chiffres et lettres a à f)"
+          chk R2_BUCKET            "$R2_BUCKET"             '^chasse-tuiles$' "exactement chasse-tuiles"
+          chk R2_ACCESS_KEY_ID     "$AWS_ACCESS_KEY_ID"     '^[0-9a-f]{32}$' "32 caractères (l'Access Key ID du jeton)"
+          chk R2_SECRET_ACCESS_KEY "$AWS_SECRET_ACCESS_KEY" '^[0-9a-f]{64}$' "64 caractères (le Secret Access Key, PAS le Token value)"
+          # On tente quand même l'écriture : c'est elle qui tranche.
+
           echo "test $(date -u +%FT%TZ)" > /tmp/r2test.txt
           out=$(r2 cp /tmp/r2test.txt "s3://${R2_BUCKET}/_test/connexion.txt" 2>&1) || \
-            fail "Écriture R2 refusée. Vérifie R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (même jeton, Object Read & Write sur ${R2_BUCKET}). Détail : $(echo "$out" | tail -1)"
+            { if [ "$bad" = 1 ]; then fail "Écriture R2 refusée. Corrige d'abord le ou les secrets signalés mal formés. Détail : $(echo "$out" | tail -1)"
+              else fail "Écriture R2 refusée alors que les 4 secrets ont le bon format : les clés viennent probablement d'un autre jeton, ou l'Account ID d'un autre compte. Détail : $(echo "$out" | tail -1)"; fi; }
           exists "_test/connexion.txt" || fail "Fichier test introuvable après écriture dans R2"
           r2 rm "s3://${R2_BUCKET}/_test/connexion.txt" >/dev/null 2>&1 || true
-          echo "Connexion R2 OK (bucket ${R2_BUCKET})"
+          echo "Connexion R2 OK"
           FIN_DU_FICHIER
           cat > scripts/test_serveur.sh <<'FIN_DU_FICHIER'
           #!/usr/bin/env bash
